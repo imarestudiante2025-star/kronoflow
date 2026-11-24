@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
@@ -53,6 +54,14 @@ class PolarBearAnimation extends StatefulWidget {
     /// Nº de caracteres del correo a partir del cual la mirada llega al máximo.
     this.maxLookChars = 30,
     this.height = 200,
+
+    /// Espera antes de disparar éxito/fallo, para que el oso termine de bajar
+    /// las manos y el disparador no se pierda.
+    this.triggerDelay = const Duration(milliseconds: 400),
+
+    /// Reinicia la State Machine antes de cada animación de éxito/fallo, salvo
+    /// la primera. Evita que el oso se quede atascado tras la primera animación.
+    this.resetBetweenTriggers = true,
   });
 
   final FocusNode emailFocusNode;
@@ -65,6 +74,8 @@ class PolarBearAnimation extends StatefulWidget {
   final double lookMax;
   final int maxLookChars;
   final double height;
+  final Duration triggerDelay;
+  final bool resetBetweenTriggers;
 
   @override
   State<PolarBearAnimation> createState() => PolarBearAnimationState();
@@ -83,6 +94,13 @@ class PolarBearAnimationState extends State<PolarBearAnimation> {
   rive.TriggerInput? _trigSuccess;
   rive.TriggerInput? _trigFail;
 
+  Timer? _fireTimer;
+  int _fireToken = 0;
+
+  /// true cuando ya se disparó una animación de éxito/fallo y la State Machine
+  /// podría haber quedado en un estado final.
+  bool _needsReset = false;
+
   bool get _ready => _status == _BearStatus.ready && !_disposed;
 
   @override
@@ -98,6 +116,7 @@ class PolarBearAnimationState extends State<PolarBearAnimation> {
   @override
   void dispose() {
     _disposed = true;
+    _fireTimer?.cancel();
     widget.emailFocusNode.removeListener(_syncEmailFocus);
     widget.passwordFocusNode.removeListener(_syncPasswordFocus);
     widget.emailController.removeListener(_syncLook);
@@ -106,23 +125,25 @@ class PolarBearAnimationState extends State<PolarBearAnimation> {
     super.dispose();
   }
 
+  // ───────── Utilidades ─────────
+
+  static void _safe(void Function() f) {
+    try {
+      f();
+    } catch (e) {
+      debugPrint('PolarBear: error al liberar recursos: $e');
+    }
+  }
+
   /// Libera inputs, controlador y archivo (en ese orden). Nunca lanza.
   void _releaseRive() {
-    void safe(void Function() f) {
-      try {
-        f();
-      } catch (e) {
-        debugPrint('PolarBear: error al liberar recursos: $e');
-      }
-    }
-
-    safe(() => _isChecking?.dispose());
-    safe(() => _isHandsUp?.dispose());
-    safe(() => _numLook?.dispose());
-    safe(() => _trigSuccess?.dispose());
-    safe(() => _trigFail?.dispose());
-    safe(() => _controller?.dispose());
-    safe(() => _file?.dispose());
+    _safe(() => _isChecking?.dispose());
+    _safe(() => _isHandsUp?.dispose());
+    _safe(() => _numLook?.dispose());
+    _safe(() => _trigSuccess?.dispose());
+    _safe(() => _trigFail?.dispose());
+    _safe(() => _controller?.dispose());
+    _safe(() => _file?.dispose());
 
     _isChecking = null;
     _isHandsUp = null;
@@ -133,27 +154,141 @@ class PolarBearAnimationState extends State<PolarBearAnimation> {
     _file = null;
   }
 
+  void _setStatus(_BearStatus s) {
+    if (_disposed || !mounted) return;
+    setState(() => _status = s);
+  }
+
+  // ───────── Animaciones de resultado ─────────
+
   /// Animación de login correcto (trigSuccess).
-  void fireLoginSuccess() => _fire(_trigSuccess, PolarBearInputs.trigSuccess);
+  void fireLoginSuccess() => _requestTrigger(PolarBearInputs.trigSuccess);
 
   /// Animación de login fallido (trigFail).
-  void fireLoginFail() => _fire(_trigFail, PolarBearInputs.trigFail);
+  void fireLoginFail() => _requestTrigger(PolarBearInputs.trigFail);
 
   /// Se conserva por compatibilidad: equivale a [fireLoginSuccess].
   void fireLoginTrigger() => fireLoginSuccess();
 
-  void _fire(rive.TriggerInput? trigger, String name) {
+  void _requestTrigger(String name) {
     if (!_ready) return;
+    debugPrint('PolarBear: petición de $name');
+
+    // Si había otra petición pendiente, manda la última.
+    _fireTimer?.cancel();
+    final token = ++_fireToken;
+
+    // El oso baja las manos y deja de mirar el correo antes del disparo.
+    _isHandsUp?.value = false;
+    _isChecking?.value = false;
+
+    _fireTimer = Timer(widget.triggerDelay, () async {
+      if (!_ready || token != _fireToken) return;
+
+      if (widget.resetBetweenTriggers && _needsReset) {
+        await _rebuildController();
+        if (!_ready || token != _fireToken) return;
+      }
+
+      _fire(name);
+      _needsReset = true;
+    });
+  }
+
+  void _fire(String name) {
+    if (!_ready) return;
+    final trigger = name == PolarBearInputs.trigFail ? _trigFail : _trigSuccess;
+    if (trigger == null) {
+      debugPrint('PolarBear: la entrada $name no existe, no se dispara');
+      return;
+    }
     try {
-      trigger?.fire();
+      trigger.fire();
+      debugPrint('PolarBear: disparado $name');
     } catch (e) {
       debugPrint('PolarBear: no se pudo disparar $name: $e');
     }
   }
 
-  void _setStatus(_BearStatus s) {
-    if (_disposed || !mounted) return;
-    setState(() => _status = s);
+  // ───────── Carga y reinicio de la State Machine ─────────
+
+  rive.RiveWidgetController _crearControlador(rive.File file) {
+    final name = widget.stateMachineName;
+    return name == null
+        ? rive.RiveWidgetController(file)
+        : rive.RiveWidgetController(
+            file,
+            stateMachineSelector: rive.StateMachineSelector.byName(name),
+          );
+  }
+
+  /// Busca las entradas por nombre y tipo; si faltan se avisa y se sigue.
+  void _enlazarEntradas(rive.RiveWidgetController controller, {bool listar = false}) {
+    final sm = controller.stateMachine;
+    _isChecking = _input<rive.BooleanInput>(
+        () => sm.boolean(PolarBearInputs.isChecking), PolarBearInputs.isChecking, 'Boolean');
+    _isHandsUp = _input<rive.BooleanInput>(
+        () => sm.boolean(PolarBearInputs.isHandsUp), PolarBearInputs.isHandsUp, 'Boolean');
+    _numLook = _input<rive.NumberInput>(
+        () => sm.number(PolarBearInputs.numLook), PolarBearInputs.numLook, 'Number');
+    _trigSuccess = _input<rive.TriggerInput>(
+        () => sm.trigger(PolarBearInputs.trigSuccess), PolarBearInputs.trigSuccess, 'Trigger');
+    _trigFail = _input<rive.TriggerInput>(
+        () => sm.trigger(PolarBearInputs.trigFail), PolarBearInputs.trigFail, 'Trigger');
+
+    // Diagnóstico: imprime las entradas REALES del .riv (solo en debug).
+    if (listar && kDebugMode) {
+      try {
+        final lista = sm.inputs.map((i) => '${i.name} (${i.runtimeType})').join(', ');
+        debugPrint('PolarBear: entradas reales de la State Machine -> $lista');
+      } catch (e) {
+        debugPrint('PolarBear: no se pudieron listar las entradas: $e');
+      }
+    }
+  }
+
+  /// Crea una State Machine nueva (el oso vuelve a su estado inicial) y
+  /// libera la anterior cuando la nueva ya se está dibujando.
+  Future<void> _rebuildController() async {
+    final file = _file;
+    if (file == null || !_ready) return;
+    debugPrint('PolarBear: reiniciando la State Machine');
+
+    final oldChecking = _isChecking;
+    final oldHandsUp = _isHandsUp;
+    final oldLook = _numLook;
+    final oldSuccess = _trigSuccess;
+    final oldFail = _trigFail;
+    final oldController = _controller;
+
+    try {
+      final nuevo = _crearControlador(file);
+      _controller = nuevo;
+      _enlazarEntradas(nuevo);
+      _needsReset = false;
+      if (mounted) setState(() {});
+    } catch (e, st) {
+      debugPrint('PolarBear: no se pudo reiniciar la State Machine: $e\n$st');
+      return;
+    }
+
+    // Espera a que el widget nuevo se dibuje antes de liberar el anterior.
+    await WidgetsBinding.instance.endOfFrame;
+
+    _safe(() => oldChecking?.dispose());
+    _safe(() => oldHandsUp?.dispose());
+    _safe(() => oldLook?.dispose());
+    _safe(() => oldSuccess?.dispose());
+    _safe(() => oldFail?.dispose());
+    _safe(() => oldController?.dispose());
+
+    if (!_ready) return;
+    _isHandsUp?.value = false;
+    _isChecking?.value = false;
+    _syncLook();
+
+    // Un instante para que la nueva State Machine arranque antes del disparo.
+    await Future<void>.delayed(const Duration(milliseconds: 60));
   }
 
   Future<void> _load() async {
@@ -187,38 +322,10 @@ class PolarBearAnimationState extends State<PolarBearAnimation> {
       }
       _file = file;
 
-      // 3) Controlador (artboard + State Machine).
-      final name = widget.stateMachineName;
-      final controller = name == null
-          ? rive.RiveWidgetController(file)
-          : rive.RiveWidgetController(
-              file,
-              stateMachineSelector: rive.StateMachineSelector.byName(name),
-            );
+      // 3) Controlador (artboard + State Machine) y entradas.
+      final controller = _crearControlador(file);
       _controller = controller;
-
-      // 4) Entradas: se buscan por nombre y tipo; si faltan se avisa y se sigue.
-      final sm = controller.stateMachine;
-      _isChecking = _input<rive.BooleanInput>(
-          () => sm.boolean(PolarBearInputs.isChecking), PolarBearInputs.isChecking, 'Boolean');
-      _isHandsUp = _input<rive.BooleanInput>(
-          () => sm.boolean(PolarBearInputs.isHandsUp), PolarBearInputs.isHandsUp, 'Boolean');
-      _numLook = _input<rive.NumberInput>(
-          () => sm.number(PolarBearInputs.numLook), PolarBearInputs.numLook, 'Number');
-      _trigSuccess = _input<rive.TriggerInput>(
-          () => sm.trigger(PolarBearInputs.trigSuccess), PolarBearInputs.trigSuccess, 'Trigger');
-      _trigFail = _input<rive.TriggerInput>(
-          () => sm.trigger(PolarBearInputs.trigFail), PolarBearInputs.trigFail, 'Trigger');
-
-      // Diagnóstico: imprime las entradas REALES del .riv (solo en debug).
-      if (kDebugMode) {
-        try {
-          final lista = sm.inputs.map((i) => '${i.name} (${i.runtimeType})').join(', ');
-          debugPrint('PolarBear: entradas reales de la State Machine -> $lista');
-        } catch (e) {
-          debugPrint('PolarBear: no se pudieron listar las entradas: $e');
-        }
-      }
+      _enlazarEntradas(controller, listar: true);
 
       if (_disposed) {
         _releaseRive();
@@ -249,6 +356,8 @@ class PolarBearAnimationState extends State<PolarBearAnimation> {
     }
   }
 
+  // ───────── Sincronización con el formulario ─────────
+
   // Correo con foco -> el oso "revisa" (isChecking).
   void _syncEmailFocus() {
     if (!_ready) return;
@@ -272,6 +381,8 @@ class PolarBearAnimationState extends State<PolarBearAnimation> {
     _numLook?.value = widget.lookMin + span * t;
   }
 
+  // ───────── Interfaz ─────────
+
   @override
   Widget build(BuildContext context) {
     final controller = _controller;
@@ -283,7 +394,11 @@ class PolarBearAnimationState extends State<PolarBearAnimation> {
         _BearStatus.ready when controller != null => Semantics(
             label: 'Oso polar guardián de KronoFlow',
             image: true,
-            child: rive.RiveWidget(controller: controller, fit: rive.Fit.contain),
+            child: rive.RiveWidget(
+              key: ObjectKey(controller),
+              controller: controller,
+              fit: rive.Fit.contain,
+            ),
           ),
         _BearStatus.loading => const Center(
             child: SizedBox(

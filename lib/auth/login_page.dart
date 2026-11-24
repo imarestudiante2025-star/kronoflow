@@ -2,10 +2,14 @@ import 'dart:async';
 import 'dart:math' as math;
 import 'dart:ui' show ImageFilter;
 
+import 'package:flutter/foundation.dart'
+    show TargetPlatform, defaultTargetPlatform, kDebugMode, kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../controllers/login_controller.dart';
+import '../services/google_auth_service.dart';
 import '../theme/app_colors.dart';
 import '../widgets/animated_background.dart';
 import '../widgets/email_field.dart';
@@ -14,6 +18,20 @@ import '../widgets/password_field.dart';
 import '../widgets/polar_bear_animation.dart';
 
 const _eslogan = 'Tu tiempo, tus tareas, tus logros.';
+
+// ───────────────────────── Configuración de login social ─────────────────────────
+
+/// Deep link para volver a la app después de Discord / Facebook (navegador).
+/// Debe coincidir con el intent-filter de AndroidManifest.xml y con
+/// Supabase → Authentication → URL Configuration → Redirect URLs.
+const _redirectMovil = 'io.supabase.kronoflow://login-callback/';
+
+/// Cambia a `true` cuando configures cada proveedor en Supabase.
+/// Mientras estén en `false`, el botón no se muestra.
+const _discordHabilitado = false;
+const _facebookHabilitado = false;
+
+enum _Proveedor { google, discord, facebook }
 
 class _Beneficio {
   const _Beneficio(this.icono, this.titulo, this.detalle);
@@ -45,6 +63,9 @@ class _LoginPageState extends State<LoginPage> with TickerProviderStateMixin {
   final _passwordVisible = ValueNotifier<bool>(false);
   final _bearKey = GlobalKey<PolarBearAnimationState>();
 
+  /// Proveedor social en curso (null = ninguno). Bloquea todos los botones.
+  _Proveedor? _socialEnCurso;
+
   /// Posición del puntero (-1..1) para el parallax del fondo.
   final _pointer = ValueNotifier<Offset>(Offset.zero);
 
@@ -60,6 +81,8 @@ class _LoginPageState extends State<LoginPage> with TickerProviderStateMixin {
     duration: const Duration(milliseconds: 1500),
   );
   bool _introIniciada = false;
+
+  bool get _ocupado => _c.cargando || _socialEnCurso != null;
 
   @override
   void didChangeDependencies() {
@@ -125,7 +148,7 @@ class _LoginPageState extends State<LoginPage> with TickerProviderStateMixin {
   }
 
   Future<void> _enviar() async {
-    if (_c.cargando) return; // evita doble envío (Enter + clic)
+    if (_ocupado) return; // evita doble envío (Enter + clic)
     if (!(_formKey.currentState?.validate() ?? false)) {
       _bearKey.currentState?.fireLoginFail();
       _sacudir();
@@ -150,7 +173,7 @@ class _LoginPageState extends State<LoginPage> with TickerProviderStateMixin {
   }
 
   Future<void> _recuperar() async {
-    if (_c.cargando) return;
+    if (_ocupado) return;
     if (_c.validarEmail(_email.text) != null) {
       _c.reportarError('Escribe tu correo para enviarte el enlace de recuperación.');
       _sacudir();
@@ -165,6 +188,91 @@ class _LoginPageState extends State<LoginPage> with TickerProviderStateMixin {
     } else if (_c.error != null) {
       _sacudir();
     }
+  }
+
+  // ───────── Login social ─────────
+
+  /// Google nativo en Android/iOS; en web y escritorio usa el navegador.
+  bool get _googleNativo =>
+      !kIsWeb &&
+      (defaultTargetPlatform == TargetPlatform.android ||
+          defaultTargetPlatform == TargetPlatform.iOS);
+
+  Future<void> _entrarConProveedor(_Proveedor proveedor) async {
+    if (_ocupado) return;
+    HapticFeedback.selectionClick();
+    FocusScope.of(context).unfocus();
+    setState(() => _socialEnCurso = proveedor);
+
+    var esperaRedireccion = false;
+    try {
+      switch (proveedor) {
+        case _Proveedor.google:
+          if (_googleNativo) {
+            await GoogleAuthService.signIn();
+          } else {
+            esperaRedireccion = true;
+            await _oauthNavegador(OAuthProvider.google);
+          }
+        case _Proveedor.discord:
+          esperaRedireccion = true;
+          await _oauthNavegador(OAuthProvider.discord);
+        case _Proveedor.facebook:
+          esperaRedireccion = true;
+          await _oauthNavegador(OAuthProvider.facebook);
+      }
+      if (!mounted) return;
+      // Con login nativo la sesión ya existe: AuthGate cambiará la pantalla.
+      // Con navegador, el éxito llega al volver por el deep link.
+      if (!esperaRedireccion) _bearKey.currentState?.fireLoginSuccess();
+    } catch (e, st) {
+      if (kDebugMode) debugPrint('Login ${proveedor.name} falló: $e\n$st');
+      if (!mounted) return;
+      if (_fueCancelado(e)) return; // el usuario cerró la ventana: no es un error
+      _bearKey.currentState?.fireLoginFail();
+      _sacudir();
+      _c.reportarError(_mensajeError(e, proveedor));
+    } finally {
+      if (mounted) setState(() => _socialEnCurso = null);
+    }
+  }
+
+  Future<void> _oauthNavegador(OAuthProvider proveedor) {
+    return Supabase.instance.client.auth.signInWithOAuth(
+      proveedor,
+      // En web Supabase vuelve a la misma URL; en móvil usa el deep link.
+      redirectTo: kIsWeb ? null : _redirectMovil,
+    );
+  }
+
+  bool _fueCancelado(Object e) {
+    if (e is PlatformException) {
+      final c = e.code.toLowerCase();
+      return c.contains('canceled') || c.contains('cancelled');
+    }
+    return e.toString().toLowerCase().contains('cancelado');
+  }
+
+  String _mensajeError(Object e, _Proveedor proveedor) {
+    final nombre = switch (proveedor) {
+      _Proveedor.google => 'Google',
+      _Proveedor.discord => 'Discord',
+      _Proveedor.facebook => 'Facebook',
+    };
+    final base = 'No se pudo iniciar sesión con $nombre.';
+
+    if (e is PlatformException) {
+      final t = '${e.code} ${e.message}'.toLowerCase();
+      if (t.contains('network')) return '$base Revisa tu conexión a internet.';
+      if (t.contains('apiexception: 10')) {
+        return '$base La app aún no está autorizada en Google (revisa paquete y SHA-1).';
+      }
+      if (t.contains('12500')) {
+        return '$base Este dispositivo necesita Google Play Services y una cuenta de Google.';
+      }
+    }
+    if (e is AuthException) return '$base ${e.message}';
+    return '$base Inténtalo de nuevo.';
   }
 
   // ───────── Interfaz ─────────
@@ -194,7 +302,7 @@ class _LoginPageState extends State<LoginPage> with TickerProviderStateMixin {
                           crossAxisAlignment: CrossAxisAlignment.center,
                           children: [
                             Expanded(
-                              child: _marca(osoAlto: osoEscritorio, amplio: true, titulo: 40),
+                              child: _marca(osoAlto: osoEscritorio, titulo: 40),
                             ),
                             const SizedBox(width: 56),
                             SizedBox(
@@ -203,18 +311,11 @@ class _LoginPageState extends State<LoginPage> with TickerProviderStateMixin {
                             ),
                           ],
                         )
-                      : Column(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            _marca(
-                              osoAlto: compacto ? 120 : (tablet ? 230 : 190),
-                              amplio: false,
-                              titulo: tablet ? 38 : (compacto ? 28 : 32),
-                              rotativo: !compacto,
-                            ),
-                            SizedBox(height: compacto ? 14 : (tablet ? 28 : 22)),
-                            _columnaForm(compacto: compacto, holgado: tablet),
-                          ],
+                      : _disposicionMovil(
+                          osoAlto: compacto ? 120 : (tablet ? 230 : 190),
+                          titulo: tablet ? 38 : (compacto ? 28 : 32),
+                          compacto: compacto,
+                          tablet: tablet,
                         );
 
                   return SingleChildScrollView(
@@ -244,13 +345,131 @@ class _LoginPageState extends State<LoginPage> with TickerProviderStateMixin {
     );
   }
 
-  /// Oso (con halo) + título centrado + eslogan.
-  /// Escritorio: tarjetas de beneficios. Móvil/tablet: un beneficio rotativo.
+  /// Móvil y tablet: título arriba, oso debajo y tarjeta del formulario
+  /// pegada al oso, tapándole un poco la parte de abajo.
+  Widget _disposicionMovil({
+    required double osoAlto,
+    required double titulo,
+    required bool compacto,
+    required bool tablet,
+  }) {
+    // Dónde empieza la tarjeta respecto al alto del oso.
+    // Más pequeño = la tarjeta sube y tapa más al oso. Más grande = lo tapa menos.
+    final inicioTarjeta = osoAlto * 0.82;
+
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        _Reveal(
+          animation: _intro,
+          start: 0,
+          end: 0.5,
+          dy: 30,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              _textoMarca(titulo: titulo, amplio: false),
+              if (!compacto) ...[
+                const SizedBox(height: 14),
+                const _BeneficioRotativo(),
+              ],
+            ],
+          ),
+        ),
+        SizedBox(height: compacto ? 8 : 16),
+        Stack(
+          clipBehavior: Clip.none,
+          alignment: Alignment.topCenter,
+          children: [
+            // El oso va detrás...
+            Positioned(
+              top: 0,
+              left: 0,
+              right: 0,
+              child: _Reveal(
+                animation: _intro,
+                start: 0.05,
+                end: 0.6,
+                dy: 30,
+                child: _osoConHalo(osoAlto),
+              ),
+            ),
+            // ...y la tarjeta encima, tapando su parte de abajo.
+            Padding(
+              padding: EdgeInsets.only(top: inicioTarjeta),
+              child: _columnaForm(compacto: compacto, holgado: tablet),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  /// Oso con halo de luz.
+  Widget _osoConHalo(double osoAlto) {
+    return Stack(
+      alignment: Alignment.center,
+      children: [
+        IgnorePointer(
+          child: Container(
+            width: osoAlto * 1.15,
+            height: osoAlto * 1.15,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              gradient: RadialGradient(
+                colors: [
+                  AppColors.auroraCyan.withValues(alpha: 0.30),
+                  AppColors.auroraCyan.withValues(alpha: 0),
+                ],
+              ),
+            ),
+          ),
+        ),
+        PolarBearAnimation(
+          key: _bearKey,
+          emailFocusNode: _emailFocus,
+          passwordFocusNode: _passwordFocus,
+          emailController: _email,
+          passwordVisible: _passwordVisible,
+          height: osoAlto,
+        ),
+      ],
+    );
+  }
+
+  /// Título "KronoFlow" + eslogan.
+  Widget _textoMarca({required double titulo, required bool amplio}) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(
+          'KronoFlow',
+          textAlign: TextAlign.center,
+          style: TextStyle(
+            fontSize: titulo,
+            fontWeight: FontWeight.w800,
+            letterSpacing: -0.8,
+            color: AppColors.textOnDark,
+          ),
+        ),
+        const SizedBox(height: 6),
+        Text(
+          _eslogan,
+          textAlign: TextAlign.center,
+          style: TextStyle(
+            fontSize: amplio ? 16 : 14,
+            fontWeight: FontWeight.w500,
+            color: AppColors.textOnDarkSoft,
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// Versión de escritorio: oso (con halo) + título + eslogan + tarjetas de beneficios.
   Widget _marca({
     required double osoAlto,
-    required bool amplio,
     required double titulo,
-    bool rotativo = false,
   }) {
     return _Reveal(
       animation: _intro,
@@ -260,64 +479,13 @@ class _LoginPageState extends State<LoginPage> with TickerProviderStateMixin {
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Stack(
-            alignment: Alignment.center,
-            children: [
-              IgnorePointer(
-                child: Container(
-                  width: osoAlto * 1.15,
-                  height: osoAlto * 1.15,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    gradient: RadialGradient(
-                      colors: [
-                        AppColors.auroraCyan.withValues(alpha: 0.30),
-                        AppColors.auroraCyan.withValues(alpha: 0),
-                      ],
-                    ),
-                  ),
-                ),
-              ),
-              PolarBearAnimation(
-                key: _bearKey,
-                emailFocusNode: _emailFocus,
-                passwordFocusNode: _passwordFocus,
-                emailController: _email,
-                passwordVisible: _passwordVisible,
-                height: osoAlto,
-              ),
-            ],
-          ),
+          _osoConHalo(osoAlto),
           const SizedBox(height: 8),
-          Text(
-            'KronoFlow',
-            textAlign: TextAlign.center,
-            style: TextStyle(
-              fontSize: titulo,
-              fontWeight: FontWeight.w800,
-              letterSpacing: -0.8,
-              color: AppColors.textOnDark,
-            ),
-          ),
-          const SizedBox(height: 6),
-          Text(
-            _eslogan,
-            textAlign: TextAlign.center,
-            style: TextStyle(
-              fontSize: amplio ? 16 : 14,
-              fontWeight: FontWeight.w500,
-              color: AppColors.textOnDarkSoft,
-            ),
-          ),
-          if (amplio) ...[
-            const SizedBox(height: 30),
-            _beneficio(_beneficios[0], 0.35),
-            _beneficio(_beneficios[1], 0.43),
-            _beneficio(_beneficios[2], 0.51),
-          ] else if (rotativo) ...[
-            const SizedBox(height: 14),
-            const _BeneficioRotativo(),
-          ],
+          _textoMarca(titulo: titulo, amplio: true),
+          const SizedBox(height: 30),
+          _beneficio(_beneficios[0], 0.35),
+          _beneficio(_beneficios[1], 0.43),
+          _beneficio(_beneficios[2], 0.51),
         ],
       ),
     );
@@ -519,7 +687,7 @@ class _LoginPageState extends State<LoginPage> with TickerProviderStateMixin {
                         EmailField(
                           controller: _email,
                           focusNode: _emailFocus,
-                          enabled: !_c.cargando,
+                          enabled: !_ocupado,
                           validator: _c.validarEmail,
                           onFieldSubmitted: (_) => _passwordFocus.requestFocus(),
                         ),
@@ -531,7 +699,7 @@ class _LoginPageState extends State<LoginPage> with TickerProviderStateMixin {
                           controller: _password,
                           focusNode: _passwordFocus,
                           visibility: _passwordVisible,
-                          enabled: !_c.cargando,
+                          enabled: !_ocupado,
                           validator: _c.validarPassword,
                           autofillHints: [
                             registro ? AutofillHints.newPassword : AutofillHints.password,
@@ -556,7 +724,7 @@ class _LoginPageState extends State<LoginPage> with TickerProviderStateMixin {
                                   child: Padding(
                                     padding: const EdgeInsets.symmetric(vertical: 6),
                                     child: TextButton(
-                                      onPressed: _c.cargando ? null : _recuperar,
+                                      onPressed: _ocupado ? null : _recuperar,
                                       style: TextButton.styleFrom(
                                         foregroundColor: AppColors.primary,
                                         visualDensity: VisualDensity.compact,
@@ -581,16 +749,30 @@ class _LoginPageState extends State<LoginPage> with TickerProviderStateMixin {
                         LoginButton(
                           text: registro ? 'Comenzar gratis' : 'Entrar al espacio de trabajo',
                           isLoading: _c.cargando,
-                          onPressed: _c.cargando ? null : _enviar,
+                          onPressed: _ocupado ? null : _enviar,
                         ),
                       ),
-                      const SizedBox(height: 14),
+                      const SizedBox(height: 18),
+
+                      // ── Login social ──
+                      item(
+                        0.63,
+                        _SeccionSocial(
+                          etiqueta: registro ? 'o regístrate con' : 'o continúa con',
+                          enCurso: _socialEnCurso,
+                          deshabilitado: _ocupado,
+                          mostrarDiscord: _discordHabilitado,
+                          mostrarFacebook: _facebookHabilitado,
+                          onSeleccionar: _entrarConProveedor,
+                        ),
+                      ),
+                      const SizedBox(height: 10),
 
                       item(
-                        0.66,
+                        0.68,
                         Center(
                           child: TextButton(
-                            onPressed: _c.cargando ? null : _c.alternarModo,
+                            onPressed: _ocupado ? null : _c.alternarModo,
                             style: TextButton.styleFrom(
                               foregroundColor: AppColors.primary,
                               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
@@ -627,6 +809,205 @@ class _LoginPageState extends State<LoginPage> with TickerProviderStateMixin {
 }
 
 // ─────────────────────────── Piezas privadas ───────────────────────────
+
+/// Separador + botones de inicio de sesión social.
+/// Google ocupa todo el ancho; Discord y Facebook (si están habilitados)
+/// comparten una fila debajo.
+class _SeccionSocial extends StatelessWidget {
+  const _SeccionSocial({
+    required this.etiqueta,
+    required this.enCurso,
+    required this.deshabilitado,
+    required this.mostrarDiscord,
+    required this.mostrarFacebook,
+    required this.onSeleccionar,
+  });
+
+  final String etiqueta;
+  final _Proveedor? enCurso;
+  final bool deshabilitado;
+  final bool mostrarDiscord;
+  final bool mostrarFacebook;
+  final ValueChanged<_Proveedor> onSeleccionar;
+
+  @override
+  Widget build(BuildContext context) {
+    final google = _BotonSocial(
+      etiqueta: 'Continuar con Google',
+      icono: const _IconoGoogle(),
+      cargando: enCurso == _Proveedor.google,
+      onPressed: deshabilitado ? null : () => onSeleccionar(_Proveedor.google),
+    );
+
+    final secundarios = <Widget>[
+      if (mostrarDiscord)
+        _BotonSocial(
+          etiqueta: 'Discord',
+          icono: const Icon(Icons.sports_esports_rounded, size: 22, color: Color(0xFF5865F2)),
+          cargando: enCurso == _Proveedor.discord,
+          onPressed: deshabilitado ? null : () => onSeleccionar(_Proveedor.discord),
+        ),
+      if (mostrarFacebook)
+        _BotonSocial(
+          etiqueta: 'Facebook',
+          icono: const _IconoFacebook(),
+          cargando: enCurso == _Proveedor.facebook,
+          onPressed: deshabilitado ? null : () => onSeleccionar(_Proveedor.facebook),
+        ),
+    ];
+
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
+          children: [
+            const Expanded(child: Divider(color: AppColors.fieldBorder, height: 1)),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              child: Text(
+                etiqueta,
+                style: const TextStyle(fontSize: 12.5, color: AppColors.textSoft),
+              ),
+            ),
+            const Expanded(child: Divider(color: AppColors.fieldBorder, height: 1)),
+          ],
+        ),
+        const SizedBox(height: 14),
+        google,
+        if (secundarios.isNotEmpty) ...[
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              for (var i = 0; i < secundarios.length; i++) ...[
+                Expanded(child: secundarios[i]),
+                if (i < secundarios.length - 1) const SizedBox(width: 10),
+              ],
+            ],
+          ),
+        ],
+      ],
+    );
+  }
+}
+
+class _BotonSocial extends StatelessWidget {
+  const _BotonSocial({
+    required this.etiqueta,
+    required this.icono,
+    required this.onPressed,
+    this.cargando = false,
+  });
+
+  final String etiqueta;
+  final Widget icono;
+  final VoidCallback? onPressed;
+  final bool cargando;
+
+  @override
+  Widget build(BuildContext context) {
+    return Semantics(
+      button: true,
+      label: etiqueta,
+      child: SizedBox(
+        height: 48,
+        child: OutlinedButton(
+          // Mientras carga mantenemos el botón "activo" visualmente para que
+          // no parpadee en gris; el bloqueo real lo hace _ocupado en la página.
+          onPressed: cargando ? () {} : onPressed,
+          style: OutlinedButton.styleFrom(
+            foregroundColor: AppColors.textDark,
+            side: const BorderSide(color: AppColors.fieldBorder),
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+          ),
+          child: AnimatedSwitcher(
+            duration: const Duration(milliseconds: 180),
+            child: cargando
+                ? const SizedBox(
+                    key: ValueKey('cargando'),
+                    width: 20,
+                    height: 20,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : Row(
+                    key: const ValueKey('contenido'),
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      icono,
+                      const SizedBox(width: 10),
+                      Flexible(
+                        child: Text(
+                          etiqueta,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(fontSize: 14.5, fontWeight: FontWeight.w600),
+                        ),
+                      ),
+                    ],
+                  ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// "G" de Google con los cuatro colores de la marca.
+class _IconoGoogle extends StatelessWidget {
+  const _IconoGoogle();
+
+  @override
+  Widget build(BuildContext context) {
+    return ShaderMask(
+      blendMode: BlendMode.srcIn,
+      shaderCallback: (rect) => const LinearGradient(
+        begin: Alignment.topRight,
+        end: Alignment.bottomLeft,
+        colors: [
+          Color(0xFFEA4335),
+          Color(0xFFFBBC05),
+          Color(0xFF34A853),
+          Color(0xFF4285F4),
+        ],
+        stops: [0.0, 0.35, 0.65, 1.0],
+      ).createShader(rect),
+      child: const Text(
+        'G',
+        style: TextStyle(
+          fontSize: 22,
+          height: 1,
+          fontWeight: FontWeight.w900,
+          color: Colors.white,
+        ),
+      ),
+    );
+  }
+}
+
+class _IconoFacebook extends StatelessWidget {
+  const _IconoFacebook();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 22,
+      height: 22,
+      alignment: Alignment.center,
+      decoration: const BoxDecoration(color: Color(0xFF1877F2), shape: BoxShape.circle),
+      child: const Text(
+        'f',
+        style: TextStyle(
+          fontSize: 16,
+          height: 1,
+          fontWeight: FontWeight.w900,
+          color: Colors.white,
+        ),
+      ),
+    );
+  }
+}
 
 /// Píldora compacta que rota los beneficios (móvil y tablet).
 class _BeneficioRotativo extends StatefulWidget {
